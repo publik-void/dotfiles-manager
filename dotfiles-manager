@@ -1,0 +1,983 @@
+#!/usr/bin/env bash
+
+# vim: foldmethod=marker
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: dotfiles-manager OPTIONS... [--] COMPONENTS...
+
+If empty, `COMPONENTS...` defaults to all components if `--list` or `--install`
+is given, otherwise to all existing components.
+
+Options:
+  --list     List components
+  --nuke     Delete components (after confirmation prompt)
+  --install  Install components
+  --update   Update components
+
+  --self     Include the `dotfiles-manager` itself in the set of available
+             components. With `--install`/`--update`, the running script does
+             not automatically call the new version of itself; this requires a
+             manual second run.
+
+  --dry      Run only "preflight" checks for the requested actions, then quit
+  --help     Show this help message
+
+A script to install/update my dotfiles. This generally excludes any
+machine-specific system configuration, but includes user configuration of shell
+utilities and some GUI apps.
+
+The script runs up to four sequential actions in the following order, with each
+action being enabled through its corresponding flag:
+- `--list`: List the selected components (as YAML):
+  - Whether they exist
+  - Whether they are in a modified (or otherwise unexpected / "dirty") state
+  - The associated managed paths
+- `--nuke`: Delete the managed paths associated with the selected components
+- `--install`: Git-clone (or otherwise write) the selected components if they do
+  not exist already
+- `--update`: Git-pull (or otherwise update) the selected components if they are
+  in a clean state
+
+Post-hooks are run for some components after install/update. The script is
+generally conservative and always prefers aborting over overwriting any
+unexpected state.
+EOF
+}
+
+# To add a new component,
+# - Add its name in `components`
+# - Add 6 functions:
+#   - `paths_…`: Managed paths associated with the component
+#   - `exists_…`: Does the component already exist?
+#   - `dirty_…`: Is the state unexpected/modified/dirty?
+#   - `install_…`: Initial installation
+#   - `update_…`: Update of an existing installation
+#   - `post_…`: Post-install/update hook
+
+# TODO: Add `aerc` (link to local repo?) and `nnn` components once the repos
+# exist
+# TODO: Potentially do a `post_nvim` if there is a good way to do it (better
+# than `nvim -c "sleep 15 | qall"`). For installing plugins and treesitter
+# languages, essentially. The actual scripting logic may belong in the
+# config-nvim repository.
+
+# Argument parsing {{{1
+
+do_list=0
+do_nuke=0
+do_install=0
+do_update=0
+include_self=0
+dry_run=0
+requested_components=()
+
+while (($#)); do
+  case "$1" in
+    --list)
+      do_list=1
+      ;;
+    --nuke)
+      do_nuke=1
+      ;;
+    --install)
+      do_install=1
+      ;;
+    --update)
+      do_update=1
+      ;;
+    --self)
+      include_self=1
+      ;;
+    --dry)
+      dry_run=1
+      ;;
+    --help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      while (($#)); do
+        requested_components+=("$1")
+        shift
+      done
+      break
+      ;;
+    -*)
+      printf 'Unknown option: %s\n' "$1" >&2
+      usage >&2
+      exit 2
+      ;;
+    *)
+      requested_components+=("$1")
+      ;;
+  esac
+
+  shift
+done
+
+if ((do_list == 0 && do_nuke == 0 && do_install == 0 && do_update == 0)); then
+  printf 'No action specified. See --help.\n' >&2
+  exit 2
+fi
+
+if ! command -v git >/dev/null; then
+  printf 'Cannot run: git is not available.\n' >&2
+  exit 1
+fi
+
+# Helpers {{{1
+
+contains() {
+  local needle="$1"
+  local item
+  shift
+
+  for item in "$@"; do
+    if [[ "${item}" == "${needle}" ]]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+yaml_quote() {
+  local value="$1"
+
+  value="${value//\'/\'\'}"
+  printf "'%s'" "${value}"
+}
+
+path_exists() {
+  [[ -e "$1" || -L "$1" ]]
+}
+
+component_call() {
+  local action="$1"
+  local component="$2"
+
+  "${action}_${component}"
+}
+
+component_state() {
+  local component="$1"
+
+  if ! component_call exists "${component}"; then
+    printf 'absent\n'
+  elif component_call dirty "${component}"; then
+    printf 'dirty\n'
+  else
+    printf 'clean\n'
+  fi
+}
+
+any() {
+  local predicate="$1"
+  local producer="$2"
+  local item
+
+  while IFS= read -r item; do
+    if "${predicate}" "${item}"; then
+      return 0
+    fi
+  done < <("${producer}")
+
+  return 1
+}
+
+parent_is_creatable() {
+  local path="$1"
+  local parent
+  local next
+
+  parent="$(dirname "${path}")"
+
+  while ! path_exists "${parent}"; do
+    next="$(dirname "${parent}")"
+    if [[ "${next}" == "${parent}" ]]; then
+      break
+    fi
+    parent="${next}"
+  done
+
+  [[ -d "${parent}" && -w "${parent}" && -x "${parent}" ]]
+}
+
+text_file_dirty() {
+  local path="$1"
+  local writer="$2"
+
+  if ! path_exists "${path}"; then
+    return 1
+  fi
+
+  if [[ -L "${path}" || ! -f "${path}" ]]; then
+    return 0
+  fi
+
+  if cmp -s "${path}" <("${writer}"); then
+    return 1
+  fi
+
+  return 0
+}
+
+ensure_link() {
+  local target="$1"
+  local link="$2"
+
+  if path_exists "${link}"; then
+    if [[ ! -L "${link}" || "$(readlink "${link}")" != "${target}" ]]; then
+      printf 'Unexpected existing path: %s\n' "${link}" >&2
+      return 1
+    fi
+  else
+    ln -s "${target}" "${link}"
+  fi
+}
+
+repo_dirty() {
+  local url="$1"
+  local path="$2"
+  local actual_url
+  local status
+  local upstream
+
+  if ! path_exists "${path}"; then
+    return 1
+  fi
+
+  if [[ -L "${path}" || ! -d "${path}/.git" ]]; then
+    return 0
+  fi
+
+  actual_url="$(
+    git -C "${path}" config --get remote.origin.url 2>/dev/null
+  )" || return 0
+
+  if [[ "${actual_url}" != "${url}" ]]; then
+    return 0
+  fi
+
+  status="$(git -C "${path}" status --porcelain 2>/dev/null)" || return 0
+
+  if [[ -n "${status}" ]]; then
+    return 0
+  fi
+
+  if ! git -C "${path}" symbolic-ref -q HEAD >/dev/null 2>&1; then
+    return 0
+  fi
+
+  upstream="$(
+    git -C "${path}" \
+      rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null
+  )" || return 0
+
+  if [[ "${upstream}" != origin/* ]]; then
+    return 0
+  fi
+
+  if ! git -C "${path}" \
+    merge-base --is-ancestor HEAD '@{u}' >/dev/null 2>&1; then
+    return 0
+  fi
+
+  return 1
+}
+
+install_repo() {
+  local url="$1"
+  local path="$2"
+
+  mkdir -p "$(dirname "${path}")"
+  git clone "${url}" "${path}"
+}
+
+update_repo() {
+  local path="$1"
+
+  git -C "${path}" pull --ff-only
+}
+
+# Components and definitions {{{1
+
+components=(
+  git
+  less
+  fish
+  nvim
+  tmux
+  cpcp
+)
+
+if ((include_self)); then
+  components+=(self)
+fi
+
+home="${HOME:?}"
+config_home="${XDG_CONFIG_HOME:-${home}/.config}"
+
+# Component: git {{{1
+
+paths_git() {
+  printf '%s\n' \
+    "${config_home}/git" \
+    "${home}/.gitconfig"
+}
+
+exists_git() {
+  any path_exists paths_git
+}
+
+dirty_git() {
+  local repo="${config_home}/git"
+  local link="${home}/.gitconfig"
+  local target="${repo}/gitconfig"
+
+  if ! exists_git; then
+    return 1
+  fi
+
+  if ! path_exists "${repo}" || [[ ! -L "${link}" ]]; then
+    return 0
+  fi
+
+  if repo_dirty \
+    https://github.com/publik-void/config-git.git \
+    "${repo}"; then
+    return 0
+  fi
+
+  if [[ "$(readlink "${link}")" != "${target}" ]]; then
+    return 0
+  fi
+
+  return 1
+}
+
+install_git() {
+  install_repo \
+    https://github.com/publik-void/config-git.git \
+    "${config_home}/git"
+}
+
+update_git() {
+  update_repo "${config_home}/git"
+}
+
+post_git() {
+  local link="${home}/.gitconfig"
+  local target="${config_home}/git/gitconfig"
+
+  if [[ -L "${link}" && "$(readlink "${link}")" == "${target}" ]]; then
+    return
+  fi
+
+  ln -s "${target}" "${link}"
+}
+
+# Component: less {{{1
+
+less_level() {
+  local version
+  version="$(LC_ALL=C less --version 2>/dev/null)" || {
+    printf '596\n'
+    return
+  }
+
+  if [[ ! "${version}" =~ ^less[[:space:]]+([0-9]+) ]]; then
+    printf '596\n'
+  elif ((BASH_REMATCH[1] < 582)); then
+    printf '581\n'
+  elif ((BASH_REMATCH[1] < 596)); then
+    printf '582\n'
+  else
+    printf '596\n'
+  fi
+}
+
+paths_less() {
+  printf '%s\n' \
+    "${config_home}/less" \
+    "${config_home}/lesskey" \
+    "${home}/.lesskey" \
+    "${home}/.less"
+}
+
+exists_less() {
+  any path_exists paths_less
+}
+
+dirty_less() {
+  local repo="${config_home}/less"
+  local source="${repo}/lesskey"
+  local config_link="${config_home}/lesskey"
+  local home_link="${home}/.lesskey"
+  local binary="${home}/.less"
+  local level
+
+  if ! path_exists "${repo}" || repo_dirty \
+    https://github.com/publik-void/config-less.git "${repo}"; then
+    return 0
+  fi
+
+  if [[ ! -L "${config_link}" ]] ||
+    [[ "$(readlink "${config_link}")" != "${source}" ]]; then
+    return 0
+  fi
+
+  level="$(less_level)"
+
+  if ((level < 596)); then
+    if [[ ! -L "${home_link}" ]] ||
+      [[ "$(readlink "${home_link}")" != "${config_link}" ]]; then
+      return 0
+    fi
+  elif path_exists "${home_link}"; then
+    return 0
+  fi
+
+  if ((level < 582)); then
+    if path_exists "${binary}" &&
+      { [[ ! -f "${binary}" ]] || [[ -L "${binary}" ]]; }; then
+      return 0
+    fi
+  elif path_exists "${binary}"; then
+    return 0
+  fi
+
+  return 1
+}
+
+install_less() {
+  install_repo \
+    https://github.com/publik-void/config-less.git \
+    "${config_home}/less"
+}
+
+update_less() {
+  update_repo "${config_home}/less"
+}
+
+post_less() {
+  local repo="${config_home}/less"
+  local config_link="${config_home}/lesskey"
+  local level
+  local tmp
+
+  level="$(less_level)"
+  mkdir -p "${config_home}"
+
+  ensure_link "${repo}/lesskey" "${config_link}"
+
+  if ((level < 596)); then
+    ensure_link "${config_link}" "${home}/.lesskey"
+  fi
+
+  if ((level < 582)); then
+    if command -v lesskey >/dev/null 2>&1; then
+      tmp="$(mktemp "${home}/.less.XXXXXX")"
+
+      if ! lesskey -o "${tmp}" "${repo}/lesskey"; then
+        rm -f -- "${tmp}"
+        return 1
+      fi
+
+      mv -- "${tmp}" "${home}/.less"
+    else
+      printf 'Warning: less <582 requires lesskey to compile ~/.less.\n' >&2
+    fi
+  fi
+}
+
+# Component: fish {{{1
+
+paths_fish() {
+  printf '%s\n' "${config_home}/fish"
+}
+
+exists_fish() {
+  any path_exists paths_fish
+}
+
+dirty_fish() {
+  repo_dirty \
+    https://github.com/publik-void/config-fish.git \
+    "${config_home}/fish"
+}
+
+install_fish() {
+  install_repo \
+    https://github.com/publik-void/config-fish.git \
+    "${config_home}/fish"
+}
+
+update_fish() {
+  update_repo "${config_home}/fish"
+}
+
+post_fish() {
+  if command -v fish >/dev/null; then
+    fish -c fish_update_completions
+  fi
+}
+
+# Component: nvim {{{1
+
+paths_nvim() {
+  printf '%s\n' "${config_home}/nvim"
+}
+
+exists_nvim() {
+  any path_exists paths_nvim
+}
+
+dirty_nvim() {
+  repo_dirty \
+    https://github.com/publik-void/config-nvim.git \
+    "${config_home}/nvim"
+}
+
+install_nvim() {
+  install_repo \
+    https://github.com/publik-void/config-nvim.git \
+    "${config_home}/nvim"
+}
+
+update_nvim() {
+  update_repo "${config_home}/nvim"
+}
+
+post_nvim() {
+  :
+}
+
+# Component: tmux {{{1
+
+paths_tmux() {
+  printf '%s\n' "${config_home}/tmux"
+}
+
+exists_tmux() {
+  any path_exists paths_tmux
+}
+
+dirty_tmux() {
+  repo_dirty \
+    https://github.com/publik-void/config-tmux.git \
+    "${config_home}/tmux"
+}
+
+install_tmux() {
+  install_repo \
+    https://github.com/publik-void/config-tmux.git \
+    "${config_home}/tmux"
+}
+
+update_tmux() {
+  update_repo "${config_home}/tmux"
+}
+
+post_tmux() {
+  :
+}
+
+# Component: cpcp {{{1
+
+paths_cpcp() {
+  printf '%s\n' \
+    "${config_home}/cpcp" \
+    "${home}/.local/bin/cpcp"
+}
+
+exists_cpcp() {
+  any path_exists paths_cpcp
+}
+
+dirty_cpcp() {
+  local repo="${config_home}/cpcp"
+  local link="${home}/.local/bin/cpcp"
+  local target="${repo}/cpcp.sh"
+
+  if ! exists_cpcp; then
+    return 1
+  fi
+
+  if ! path_exists "${repo}" || [[ ! -L "${link}" ]]; then
+    return 0
+  fi
+
+  if repo_dirty \
+    https://github.com/publik-void/cross-platform-copy-paste.git \
+    "${repo}"; then
+    return 0
+  fi
+
+  if [[ "$(readlink "${link}")" != "${target}" ]]; then
+    return 0
+  fi
+
+  return 1
+}
+
+install_cpcp() {
+  install_repo \
+    https://github.com/publik-void/cross-platform-copy-paste.git \
+    "${config_home}/cpcp"
+}
+
+update_cpcp() {
+  update_repo "${config_home}/cpcp"
+}
+
+post_cpcp() {
+  local link="${home}/.local/bin/cpcp"
+  local target="${config_home}/cpcp/cpcp.sh"
+
+  mkdir -p "${home}/.local/bin"
+
+  if [[ -L "${link}" && "$(readlink "${link}")" == "${target}" ]]; then
+    return
+  fi
+
+  ln -s "${target}" "${link}"
+}
+
+# Component: self {{{1
+
+paths_self() {
+  printf '%s\n' \
+    "${config_home}/dotfiles-manager" \
+    "${home}/.local/bin/dotfiles-manager"
+}
+
+exists_self() {
+  any path_exists paths_dotfiles-manager
+}
+
+dirty_self() {
+  local repo="${config_home}/dotfiles-manager"
+  local link="${home}/.local/bin/dotfiles-manager"
+  local target="${repo}/dotfiles-manager"
+
+  if ! exists_self; then
+    return 1
+  fi
+
+  if ! path_exists "${repo}" || [[ ! -L "${link}" ]]; then
+    return 0
+  fi
+
+  if repo_dirty \
+    https://github.com/publik-void/dotfiles-manager.git \
+    "${repo}"; then
+    return 0
+  fi
+
+  if [[ "$(readlink "${link}")" != "${target}" ]]; then
+    return 0
+  fi
+
+  return 1
+}
+
+install_self() {
+  install_repo \
+    https://github.com/publik-void/dotfiles-manager.git \
+    "${config_home}/dotfiles-manager"
+}
+
+update_self() {
+  update_repo "${config_home}/dotfiles-manager"
+}
+
+post_self() {
+  local link="${home}/.local/bin/dotfiles-manager"
+  local target="${config_home}/dotfiles-manager/dotfiles-manager"
+
+  mkdir -p "${home}/.local/bin"
+
+  if [[ -L "${link}" && "$(readlink "${link}")" == "${target}" ]]; then
+    return
+  fi
+
+  ln -s "${target}" "${link}"
+}
+
+# Component selection {{{1
+
+selected_components=()
+
+if ((${#requested_components[@]})); then
+  for component in "${requested_components[@]}"; do
+    if ! contains "${component}" "${components[@]}"; then
+      printf 'Unknown component: %s\n' "${component}" >&2
+      printf 'Valid components:' >&2
+      printf ' %s' "${components[@]}" >&2
+      printf '\n' >&2
+      exit 2
+    fi
+
+    if ((${#selected_components[@]} == 0)) ||
+      ! contains "${component}" "${selected_components[@]}"; then
+      selected_components+=("${component}")
+    fi
+  done
+elif ((do_list || do_install)); then
+  selected_components=("${components[@]}")
+else
+  for component in "${components[@]}"; do
+    if component_call exists "${component}"; then
+      selected_components+=("${component}")
+    fi
+  done
+fi
+
+if ((${#selected_components[@]} == 0)); then
+  printf 'No components selected.\n'
+  exit 0
+fi
+
+# Run {{{1
+
+preflight_install_paths() {
+  local component="$1"
+  local path
+
+  while IFS= read -r path; do
+    if ! parent_is_creatable "${path}"; then
+      printf \
+        'Cannot install %s: parent path for %s is not creatable.\n' \
+        "${component}" "${path}" >&2
+      return 1
+    fi
+  done < <(component_call paths "${component}")
+}
+
+preflight() {
+  local component
+  local state
+  local installed_in_run
+  local failed=0
+
+  for component in "${selected_components[@]}"; do
+    state="$(component_state "${component}")"
+    installed_in_run=0
+
+    if ((do_nuke)); then
+      state=absent
+    fi
+
+    if ((do_install)); then
+      case "${state}" in
+        absent)
+          if preflight_install_paths "${component}"; then
+            state=clean
+            installed_in_run=1
+          else
+            failed=1
+          fi
+          ;;
+        clean)
+          ;;
+        dirty)
+          printf \
+            'Cannot install %s: component is dirty or otherwise unexpected.\n' \
+            "${component}" >&2
+          failed=1
+          ;;
+      esac
+    fi
+
+    if ((do_update && installed_in_run == 0)); then
+      case "${state}" in
+        absent)
+          printf \
+            'Cannot update %s: component would not exist at the ' \
+            "${component}" >&2
+          printf 'update stage.\n' >&2
+          failed=1
+          ;;
+        dirty)
+          printf \
+            'Cannot update %s: component is dirty or otherwise unexpected.\n' \
+            "${component}" >&2
+          failed=1
+          ;;
+        clean)
+          ;;
+      esac
+    fi
+  done
+
+  if ((failed)); then
+    printf \
+      'No changes were made. Adjust the selected components or resolve the ' >&2
+    printf 'reported state first.\n' >&2
+    return 1
+  fi
+}
+
+list_components() {
+  local component
+  local exists
+  local dirty
+  local path
+
+  for component in "${selected_components[@]}"; do
+    if component_call exists "${component}"; then
+      exists=true
+      if component_call dirty "${component}"; then
+        dirty=true
+      else
+        dirty=false
+      fi
+    else
+      exists=false
+      dirty=null
+    fi
+
+    printf '%s:\n' "${component}"
+    printf '  exists: %s\n' "${exists}"
+    printf '  dirty: %s\n' "${dirty}"
+    printf '  paths:\n'
+
+    while IFS= read -r path; do
+      printf '    - '
+      yaml_quote "${path}"
+      printf '\n'
+    done < <(component_call paths "${component}")
+  done
+}
+
+nuke_components() {
+  local component
+  local path
+  local reply
+  local nuke_paths=()
+
+  for component in "${selected_components[@]}"; do
+    while IFS= read -r path; do
+      if path_exists "${path}" &&
+        { ((${#nuke_paths[@]} == 0)) ||
+          ! contains "${path}" "${nuke_paths[@]}"; }; then
+        nuke_paths+=("${path}")
+      fi
+    done < <(component_call paths "${component}")
+  done
+
+  if ((${#nuke_paths[@]} == 0)); then
+    printf 'Nothing to remove.\n'
+    return
+  fi
+
+  if ! exec 3<>/dev/tty 2>/dev/null; then
+    printf \
+      'Cannot run --nuke: no controlling terminal is available.\n' >&2
+    return 1
+  fi
+
+  printf 'The following paths will be removed recursively:\n\n' >&3
+
+  for path in "${nuke_paths[@]}"; do
+    printf '  %s\n' "${path}" >&3
+  done
+
+  printf '\nType "yes" to continue: ' >&3
+
+  reply=""
+  IFS= read -r reply <&3 || true
+
+  if [[ "${reply}" != yes ]]; then
+    printf 'Aborted.\n' >&3
+    exec 3>&-
+    return 1
+  fi
+
+  printf '\nRemoving managed paths...\n' >&3
+
+  for path in "${nuke_paths[@]}"; do
+    rm -rf -- "${path}"
+  done
+
+  exec 3>&-
+  printf 'Done.\n'
+}
+
+
+install_components() {
+  local component
+
+  for component in "${selected_components[@]}"; do
+    if component_call exists "${component}"; then
+      continue
+    fi
+
+    printf 'Installing %s...\n' "${component}"
+    component_call install "${component}"
+    installed_components+=("${component}")
+    changed_components+=("${component}")
+  done
+}
+
+update_components() {
+  local component
+
+  for component in "${selected_components[@]}"; do
+    if ((${#installed_components[@]})) &&
+      contains "${component}" "${installed_components[@]}"; then
+      continue
+    fi
+
+    printf 'Updating %s...\n' "${component}"
+    component_call update "${component}"
+    changed_components+=("${component}")
+  done
+}
+
+run_post_hooks() {
+  local component
+
+  if ((${#changed_components[@]} == 0)); then
+    return
+  fi
+
+  for component in "${changed_components[@]}"; do
+    component_call post "${component}"
+  done
+}
+
+
+if ((do_list)); then
+  list_components
+fi
+
+if ((do_nuke || do_install || do_update)); then
+  preflight
+fi
+
+if ((dry_run)); then
+  exit 0
+fi
+
+if ((do_nuke)); then
+  nuke_components
+fi
+
+installed_components=()
+changed_components=()
+
+if ((do_install)); then
+  install_components
+fi
+
+if ((do_update)); then
+  update_components
+fi
+
+run_post_hooks
